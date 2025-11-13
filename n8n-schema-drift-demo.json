@@ -1,0 +1,222 @@
+{
+  "name": "Schema Drift Detection & Evolution Demo",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "chat-trigger",
+      "name": "Chat Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse chat input - accepts commands like:\n// 'run demo'\n// 'ingest batch A'\n// 'ingest batch B'\n// 'propose patch'\n// 'enable compat'\n// 'apply v2'\n\nconst chatInput = ($input.item.json.chat_message || $input.item.json.message || $input.item.json.text || 'run demo').toLowerCase();\n\nlet command = 'run_demo';\nif (chatInput.includes('batch a') || chatInput.includes('good data')) {\n  command = 'ingest_batch_a';\n} else if (chatInput.includes('batch b') || chatInput.includes('drift') || chatInput.includes('bad data')) {\n  command = 'ingest_batch_b';\n} else if (chatInput.includes('propose') || chatInput.includes('patch')) {\n  command = 'propose_patch';\n} else if (chatInput.includes('enable') || chatInput.includes('compat')) {\n  command = 'enable_compat';\n} else if (chatInput.includes('v2') || chatInput.includes('apply')) {\n  command = 'apply_v2';\n} else if (chatInput.includes('read') || chatInput.includes('query')) {\n  command = 'read_flights';\n}\n\nreturn {\n  json: {\n    command: command,\n    original_input: chatInput,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "parse-command",
+      "name": "Parse Chat Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 0: Setup DuckDB schemas and v1 contract\n// Simulating DuckDB operations in JavaScript\n\nconst command = $input.item.json.command;\n\n// Initialize in-memory database simulation\nif (!$workflow.staticData.db) {\n  $workflow.staticData.db = {\n    staging: { flights_raw: [] },\n    gold: { flights_pricing_v1: [], flights_pricing_v2: [] },\n    ops: { quarantine: [] },\n    featureFlags: { flights_pricing_read_compat: false },\n    compatView: null\n  };\n}\n\nconst db = $workflow.staticData.db;\n\n// v1 Schema Contract (Pandera-like validation)\nfunction validateV1(record) {\n  const errors = [];\n  \n  // flight_id: string, min 3 chars\n  if (!record.flight_id || typeof record.flight_id !== 'string' || record.flight_id.length < 3) {\n    errors.push('flight_id: must be string with min 3 characters');\n  }\n  \n  // origin: string, exactly 3 chars\n  if (!record.origin || typeof record.origin !== 'string' || record.origin.length !== 3) {\n    errors.push('origin: must be exactly 3 characters');\n  }\n  \n  // destination: string, exactly 3 chars\n  if (!record.destination || typeof record.destination !== 'string' || record.destination.length !== 3) {\n    errors.push('destination: must be exactly 3 characters');\n  }\n  \n  // depart_ts: valid timestamp\n  if (!record.depart_ts || isNaN(new Date(record.depart_ts).getTime())) {\n    errors.push('depart_ts: must be valid timestamp');\n  }\n  \n  // cabin: enum\n  const validCabins = ['ECONOMY', 'PREMIUM', 'BUSINESS', 'FIRST'];\n  if (!validCabins.includes(record.cabin)) {\n    errors.push(`cabin: must be one of ${validCabins.join(', ')}`);\n  }\n  \n  // fare_usd: number >= 0\n  if (typeof record.fare_usd !== 'number' || record.fare_usd < 0) {\n    errors.push('fare_usd: must be number >= 0');\n  }\n  \n  // carrier_code: string, 2-3 chars\n  if (!record.carrier_code || typeof record.carrier_code !== 'string' || record.carrier_code.length < 2 || record.carrier_code.length > 3) {\n    errors.push('carrier_code: must be string with 2-3 characters');\n  }\n  \n  // currency: enum\n  const validCurrencies = ['USD', 'EUR', 'GBP'];\n  if (!validCurrencies.includes(record.currency)) {\n    errors.push(`currency: must be one of ${validCurrencies.join(', ')}`);\n  }\n  \n  // taxes_usd: number >= 0, nullable\n  if (record.taxes_usd !== null && record.taxes_usd !== undefined) {\n    if (typeof record.taxes_usd !== 'number' || record.taxes_usd < 0) {\n      errors.push('taxes_usd: must be number >= 0 or null');\n    }\n  }\n  \n  return errors;\n}\n\nconst output = {\n  stage: '0. Setup Complete',\n  timestamp: new Date().toISOString(),\n  schemas_created: ['staging.flights_raw', 'gold.flights_pricing_v1', 'ops.quarantine'],\n  v1_contract: {\n    flight_id: 'string (min 3 chars)',\n    origin: 'string (exactly 3 chars)',\n    destination: 'string (exactly 3 chars)',\n    depart_ts: 'timestamp',\n    cabin: 'ECONOMY|PREMIUM|BUSINESS|FIRST',\n    fare_usd: 'number >= 0',\n    carrier_code: 'string (2-3 chars)',\n    currency: 'USD|EUR|GBP',\n    taxes_usd: 'number >= 0 (nullable)'\n  },\n  command: command,\n  db_initialized: true\n};\n\nreturn {\n  json: {\n    ...$input.item.json,\n    ...output,\n    db_state: {\n      staging_count: db.staging.flights_raw.length,\n      gold_v1_count: db.gold.flights_pricing_v1.length,\n      quarantine_count: db.ops.quarantine.length\n    }\n  }\n};"
+      },
+      "id": "setup-schemas",
+      "name": "Setup Schemas & v1 Contract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 1: Ingest Batch A (good data)\nconst db = $workflow.staticData.db;\nconst command = $input.item.json.command;\n\nif (command !== 'run_demo' && command !== 'ingest_batch_a') {\n  return { json: { ...$input.item.json, skipped: true, reason: 'Command not ingest_batch_a' } };\n}\n\n// Batch A: Good data\nconst batchA = [{\n  flight_id: 'AA1234',\n  origin: 'JFK',\n  destination: 'SFO',\n  depart_ts: '2025-06-01T16:00:00Z',\n  cabin: 'ECONOMY',\n  fare_usd: 329.5,\n  carrier_code: 'AA',\n  currency: 'USD',\n  taxes_usd: 54.2\n}];\n\n// Validate using v1 contract\nfunction validateV1(record) {\n  const errors = [];\n  if (!record.flight_id || typeof record.flight_id !== 'string' || record.flight_id.length < 3) errors.push('flight_id invalid');\n  if (!record.origin || typeof record.origin !== 'string' || record.origin.length !== 3) errors.push('origin invalid');\n  if (!record.destination || typeof record.destination !== 'string' || record.destination.length !== 3) errors.push('destination invalid');\n  if (!record.depart_ts || isNaN(new Date(record.depart_ts).getTime())) errors.push('depart_ts invalid');\n  const validCabins = ['ECONOMY', 'PREMIUM', 'BUSINESS', 'FIRST'];\n  if (!validCabins.includes(record.cabin)) errors.push('cabin invalid');\n  if (typeof record.fare_usd !== 'number' || record.fare_usd < 0) errors.push('fare_usd invalid');\n  if (!record.carrier_code || typeof record.carrier_code !== 'string' || record.carrier_code.length < 2 || record.carrier_code.length > 3) errors.push('carrier_code invalid');\n  const validCurrencies = ['USD', 'EUR', 'GBP'];\n  if (!validCurrencies.includes(record.currency)) errors.push('currency invalid');\n  if (record.taxes_usd !== null && record.taxes_usd !== undefined && (typeof record.taxes_usd !== 'number' || record.taxes_usd < 0)) errors.push('taxes_usd invalid');\n  return errors;\n}\n\nconst corrId = `corr-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;\nconst ts = new Date().toISOString();\n\n// Try to validate\nconst errors = validateV1(batchA[0]);\n\nif (errors.length === 0) {\n  // Success: insert into gold\n  db.gold.flights_pricing_v1.push({ ...batchA[0], correlation_id: corrId, received_at: ts });\n  \n  return {\n    json: {\n      ...$input.item.json,\n      stage: '1. Batch A Ingested (✅ SUCCESS)',\n      timestamp: ts,\n      correlation_id: corrId,\n      input_data: batchA[0],\n      validation_result: 'PASSED',\n      action: 'Inserted into gold.flights_pricing_v1',\n      rows_inserted: 1,\n      db_state: {\n        staging_count: db.staging.flights_raw.length,\n        gold_v1_count: db.gold.flights_pricing_v1.length,\n        quarantine_count: db.ops.quarantine.length\n      }\n    }\n  };\n} else {\n  // Failure: quarantine\n  db.ops.quarantine.push({\n    correlation_id: corrId,\n    received_at: ts,\n    reason: errors.join('; '),\n    sample: JSON.stringify(batchA[0])\n  });\n  \n  return {\n    json: {\n      ...$input.item.json,\n      stage: '1. Batch A Ingested (🛑 QUARANTINED)',\n      timestamp: ts,\n      correlation_id: corrId,\n      input_data: batchA[0],\n      validation_result: 'FAILED',\n      validation_errors: errors,\n      action: 'Quarantined',\n      db_state: {\n        staging_count: db.staging.flights_raw.length,\n        gold_v1_count: db.gold.flights_pricing_v1.length,\n        quarantine_count: db.ops.quarantine.length\n      }\n    }\n  };\n}\n\n// Always store raw\nif (!db.staging.flights_raw.find(r => r.correlation_id === corrId)) {\n  db.staging.flights_raw.push({\n    correlation_id: corrId,\n    received_at: ts,\n    payload_json: JSON.stringify(batchA)\n  });\n}"
+      },
+      "id": "ingest-batch-a",
+      "name": "Ingest Batch A (Good Data)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 2: Ingest Batch B (drift data)\nconst db = $workflow.staticData.db;\nconst command = $input.item.json.command;\n\nif (command !== 'run_demo' && command !== 'ingest_batch_b') {\n  return { json: { ...$input.item.json, skipped: true, reason: 'Command not ingest_batch_b' } };\n}\n\n// Batch B: Drift data (bad type + additive column)\nconst batchB = [{\n  flight_id: 'DL567',\n  origin: 'ATL',\n  destination: 'LAX',\n  depart_ts: '2025-06-02T09:30:00Z',\n  cabin: 'ECONOMY',\n  fare_usd: 'three hundred',  // ❌ BAD TYPE: string instead of number\n  carrier_code: 'DL',\n  currency: 'USD',\n  taxes_usd: 47.1,\n  channel: 'mobile'  // ❌ ADDITIVE COLUMN: not in v1 schema\n}];\n\n// Validate using v1 contract\nfunction validateV1(record) {\n  const errors = [];\n  if (!record.flight_id || typeof record.flight_id !== 'string' || record.flight_id.length < 3) errors.push('flight_id invalid');\n  if (!record.origin || typeof record.origin !== 'string' || record.origin.length !== 3) errors.push('origin invalid');\n  if (!record.destination || typeof record.destination !== 'string' || record.destination.length !== 3) errors.push('destination invalid');\n  if (!record.depart_ts || isNaN(new Date(record.depart_ts).getTime())) errors.push('depart_ts invalid');\n  const validCabins = ['ECONOMY', 'PREMIUM', 'BUSINESS', 'FIRST'];\n  if (!validCabins.includes(record.cabin)) errors.push('cabin invalid');\n  if (typeof record.fare_usd !== 'number' || record.fare_usd < 0) errors.push('fare_usd: must be number >= 0 (got: ' + typeof record.fare_usd + ')');\n  if (!record.carrier_code || typeof record.carrier_code !== 'string' || record.carrier_code.length < 2 || record.carrier_code.length > 3) errors.push('carrier_code invalid');\n  const validCurrencies = ['USD', 'EUR', 'GBP'];\n  if (!validCurrencies.includes(record.currency)) errors.push('currency invalid');\n  if (record.taxes_usd !== null && record.taxes_usd !== undefined && (typeof record.taxes_usd !== 'number' || record.taxes_usd < 0)) errors.push('taxes_usd invalid');\n  // Note: channel is additive, not validated but will cause schema drift\n  return errors;\n}\n\nconst corrId = `corr-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;\nconst ts = new Date().toISOString();\n\n// Try to validate\nconst errors = validateV1(batchB[0]);\n\n// Always quarantine due to drift\nif (errors.length > 0 || batchB[0].channel) {\n  const reason = errors.length > 0 \n    ? errors.join('; ') \n    : 'Schema drift detected: additive column \"channel\" not in v1 contract';\n  \n  db.ops.quarantine.push({\n    correlation_id: corrId,\n    received_at: ts,\n    reason: reason,\n    sample: JSON.stringify(batchB[0])\n  });\n  \n  return {\n    json: {\n      ...$input.item.json,\n      stage: '2. Batch B Ingested (🛑 QUARANTINED - Schema Drift)',\n      timestamp: ts,\n      correlation_id: corrId,\n      input_data: batchB[0],\n      validation_result: 'FAILED',\n      validation_errors: errors.length > 0 ? errors : ['Additive column: channel'],\n      drift_detected: true,\n      drift_details: {\n        type_error: 'fare_usd is string \"three hundred\" instead of number',\n        additive_column: 'channel field not in v1 schema'\n      },\n      action: 'Quarantined for schema drift',\n      db_state: {\n        staging_count: db.staging.flights_raw.length,\n        gold_v1_count: db.gold.flights_pricing_v1.length,\n        quarantine_count: db.ops.quarantine.length\n      }\n    }\n  };\n}\n\n// Always store raw\nif (!db.staging.flights_raw.find(r => r.correlation_id === corrId)) {\n  db.staging.flights_raw.push({\n    correlation_id: corrId,\n    received_at: ts,\n    payload_json: JSON.stringify(batchB)\n  });\n}"
+      },
+      "id": "ingest-batch-b",
+      "name": "Ingest Batch B (Drift Data)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 3: Agent proposes patch from quarantine\nconst db = $workflow.staticData.db;\nconst command = $input.item.json.command;\n\nif (command !== 'run_demo' && command !== 'propose_patch') {\n  return { json: { ...$input.item.json, skipped: true, reason: 'Command not propose_patch' } };\n}\n\n// Get latest quarantine item\nconst quarantine = db.ops.quarantine;\nif (quarantine.length === 0) {\n  return {\n    json: {\n      ...$input.item.json,\n      stage: '3. Agent Analysis (No Quarantine Items)',\n      timestamp: new Date().toISOString(),\n      message: 'No quarantine items found'\n    }\n  };\n}\n\nconst latest = quarantine[quarantine.length - 1];\nconst sample = JSON.parse(latest.sample);\n\n// Analyze and propose compatibility view\nconst suggestions = [];\n\nif (latest.reason.includes('fare_usd') && latest.reason.includes('string')) {\n  suggestions.push({\n    issue: 'fare_usd type mismatch',\n    solution: 'CAST with tolerance: TRY_CAST(fare_usd AS DOUBLE) AS fare_usd',\n    sql_fragment: 'TRY_CAST(fare_usd AS DOUBLE) AS fare_usd'\n  });\n}\n\nif (sample.channel) {\n  suggestions.push({\n    issue: 'Additive column: channel',\n    solution: 'Add nullable column: CAST(NULL AS VARCHAR) AS channel',\n    sql_fragment: 'CAST(NULL AS VARCHAR) AS channel'\n  });\n}\n\n// Build compatibility view SQL\nconst compatViewSQL = `CREATE OR REPLACE VIEW gold.flights_pricing_compat AS\nSELECT\n  flight_id, origin, destination, depart_ts, cabin,\n  /* cast with tolerance */ TRY_CAST(fare_usd AS DOUBLE) AS fare_usd,\n  carrier_code, currency, taxes_usd,\n  /* additive nullable */ CAST(NULL AS VARCHAR) AS channel\nFROM gold.flights_pricing_v1;`;\n\n// Store compat view\nif (!db.compatView) {\n  db.compatView = compatViewSQL;\n}\n\nreturn {\n  json: {\n    ...$input.item.json,\n    stage: '3. Agent Analysis & Patch Proposal',\n    timestamp: new Date().toISOString(),\n    quarantine_analysis: {\n      correlation_id: latest.correlation_id,\n      reason: latest.reason,\n      sample: sample\n    },\n    agent_suggestions: suggestions,\n    proposed_compat_view: compatViewSQL,\n    pr_file: 'PR_flights_pricing_compat.sql',\n    recommendation: 'Low-risk compat view ready; enable via feature flag for readers',\n    db_state: {\n      staging_count: db.staging.flights_raw.length,\n      gold_v1_count: db.gold.flights_pricing_v1.length,\n      quarantine_count: db.ops.quarantine.length\n    }\n  }\n};"
+      },
+      "id": "propose-patch",
+      "name": "Agent: Propose Patch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 4: Enable compat view via feature flag\nconst db = $workflow.staticData.db;\nconst command = $input.item.json.command;\n\nif (command !== 'run_demo' && command !== 'enable_compat' && command !== 'read_flights') {\n  return { json: { ...$input.item.json, skipped: true, reason: 'Command not enable_compat or read_flights' } };\n}\n\n// Enable feature flag\nif (command === 'enable_compat' || command === 'run_demo') {\n  db.featureFlags.flights_pricing_read_compat = true;\n}\n\n// Read flights using appropriate view\nlet flights;\nif (db.featureFlags.flights_pricing_read_compat && db.compatView) {\n  // Use compat view (simulated)\n  flights = db.gold.flights_pricing_v1.map(f => ({\n    ...f,\n    fare_usd: typeof f.fare_usd === 'number' ? f.fare_usd : null, // TRY_CAST simulation\n    channel: null // Additive column\n  }));\n} else {\n  // Use v1 table\n  flights = db.gold.flights_pricing_v1;\n}\n\nreturn {\n  json: {\n    ...$input.item.json,\n    stage: '4. Feature Flag & Read Flights',\n    timestamp: new Date().toISOString(),\n    feature_flag_enabled: db.featureFlags.flights_pricing_read_compat,\n    view_used: db.featureFlags.flights_pricing_read_compat ? 'gold.flights_pricing_compat' : 'gold.flights_pricing_v1',\n    flights: flights,\n    flight_count: flights.length,\n    db_state: {\n      staging_count: db.staging.flights_raw.length,\n      gold_v1_count: db.gold.flights_pricing_v1.length,\n      quarantine_count: db.ops.quarantine.length\n    }\n  }\n};"
+      },
+      "id": "enable-compat",
+      "name": "Enable Compat View (Feature Flag)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Step 5: Apply v2 schema and replay\nconst db = $workflow.staticData.db;\nconst command = $input.item.json.command;\n\nif (command !== 'run_demo' && command !== 'apply_v2') {\n  return { json: { ...$input.item.json, skipped: true, reason: 'Command not apply_v2' } };\n}\n\n// v2 schema extends v1 with nullable channel\n// Get last raw payload from staging\nconst lastRaw = db.staging.flights_raw[db.staging.flights_raw.length - 1];\nif (!lastRaw) {\n  return {\n    json: {\n      ...$input.item.json,\n      stage: '5. Apply v2 Schema (No Raw Data)',\n      timestamp: new Date().toISOString(),\n      message: 'No raw data found to replay'\n    }\n  };\n}\n\nconst rawPayload = JSON.parse(lastRaw.payload_json);\nconst record = rawPayload[0];\n\n// v2 validation (extends v1, adds channel)\nfunction validateV2(record) {\n  const errors = [];\n  // v1 validations\n  if (!record.flight_id || typeof record.flight_id !== 'string' || record.flight_id.length < 3) errors.push('flight_id invalid');\n  if (!record.origin || typeof record.origin !== 'string' || record.origin.length !== 3) errors.push('origin invalid');\n  if (!record.destination || typeof record.destination !== 'string' || record.destination.length !== 3) errors.push('destination invalid');\n  if (!record.depart_ts || isNaN(new Date(record.depart_ts).getTime())) errors.push('depart_ts invalid');\n  const validCabins = ['ECONOMY', 'PREMIUM', 'BUSINESS', 'FIRST'];\n  if (!validCabins.includes(record.cabin)) errors.push('cabin invalid');\n  \n  // v2: tolerate string fare_usd, convert to number\n  let fareUsd = record.fare_usd;\n  if (typeof fareUsd === 'string') {\n    // Try to extract number from string\n    const numMatch = fareUsd.match(/[0-9.]+/);\n    if (numMatch) {\n      fareUsd = parseFloat(numMatch[0]);\n    } else {\n      fareUsd = null; // NULL on failure\n    }\n  }\n  if (fareUsd !== null && (typeof fareUsd !== 'number' || fareUsd < 0)) {\n    errors.push('fare_usd invalid after conversion');\n  }\n  \n  if (!record.carrier_code || typeof record.carrier_code !== 'string' || record.carrier_code.length < 2 || record.carrier_code.length > 3) errors.push('carrier_code invalid');\n  const validCurrencies = ['USD', 'EUR', 'GBP'];\n  if (!validCurrencies.includes(record.currency)) errors.push('currency invalid');\n  if (record.taxes_usd !== null && record.taxes_usd !== undefined && (typeof record.taxes_usd !== 'number' || record.taxes_usd < 0)) errors.push('taxes_usd invalid');\n  \n  // v2: channel is nullable, no validation needed\n  \n  return { errors, fareUsd };\n}\n\nconst { errors, fareUsd } = validateV2(record);\n\nif (errors.length === 0) {\n  // Create v2 table if not exists (simulated)\n  if (!db.gold.flights_pricing_v2) {\n    db.gold.flights_pricing_v2 = [];\n  }\n  \n  // Insert into v2 with converted fare_usd and channel\n  const v2Record = {\n    ...record,\n    fare_usd: fareUsd,\n    channel: record.channel || null,\n    correlation_id: lastRaw.correlation_id,\n    received_at: lastRaw.received_at,\n    schema_version: 'v2'\n  };\n  \n  db.gold.flights_pricing_v2.push(v2Record);\n  \n  return {\n    json: {\n      ...$input.item.json,\n      stage: '5. v2 Schema Applied & Replay Successful',\n      timestamp: new Date().toISOString(),\n      v2_schema_changes: {\n        added_column: 'channel (nullable VARCHAR)',\n        fare_usd_tolerance: 'TRY_CAST with NULL on failure'\n      },\n      replayed_record: v2Record,\n      validation_result: 'PASSED (v2)',\n      action: 'Inserted into gold.flights_pricing_v2',\n      migration_note: 'Downstreams can migrate to v2 when ready',\n      db_state: {\n        staging_count: db.staging.flights_raw.length,\n        gold_v1_count: db.gold.flights_pricing_v1.length,\n        gold_v2_count: db.gold.flights_pricing_v2.length,\n        quarantine_count: db.ops.quarantine.length\n      }\n    }\n  };\n} else {\n  return {\n    json: {\n      ...$input.item.json,\n      stage: '5. v2 Schema Applied (Replay Failed)',\n      timestamp: new Date().toISOString(),\n      validation_result: 'FAILED (v2)',\n      validation_errors: errors,\n      raw_record: record\n    }\n  };\n}"
+      },
+      "id": "apply-v2",
+      "name": "Apply v2 Schema & Replay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format final output with all stages\nconst stages = [];\n\n// Collect all stage outputs\nif ($input.item.json.stage) {\n  stages.push({\n    stage: $input.item.json.stage,\n    timestamp: $input.item.json.timestamp,\n    data: $input.item.json\n  });\n}\n\n// Build summary\nconst summary = {\n  workflow: 'Schema Drift Detection & Evolution Demo',\n  completed_at: new Date().toISOString(),\n  stages_completed: stages.length,\n  final_state: {\n    staging_records: $input.item.json.db_state?.staging_count || 0,\n    gold_v1_records: $input.item.json.db_state?.gold_v1_count || 0,\n    gold_v2_records: $input.item.json.db_state?.gold_v2_count || 0,\n    quarantined_records: $input.item.json.db_state?.quarantine_count || 0\n  },\n  feature_flags: {\n    flights_pricing_read_compat: $input.item.json.feature_flag_enabled || false\n  }\n};\n\nreturn {\n  json: {\n    summary: summary,\n    stages: stages,\n    full_output: $input.item.json\n  }\n};"
+      },
+      "id": "format-output",
+      "name": "Format Final Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.command }}",
+              "rightValue": "run_demo",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "check-command",
+      "name": "Check Command",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [460, 500]
+    }
+  ],
+  "connections": {
+    "Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Chat Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Chat Command": {
+      "main": [
+        [
+          {
+            "node": "Setup Schemas & v1 Contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Setup Schemas & v1 Contract": {
+      "main": [
+        [
+          {
+            "node": "Ingest Batch A (Good Data)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingest Batch A (Good Data)": {
+      "main": [
+        [
+          {
+            "node": "Ingest Batch B (Drift Data)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingest Batch B (Drift Data)": {
+      "main": [
+        [
+          {
+            "node": "Agent: Propose Patch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent: Propose Patch": {
+      "main": [
+        [
+          {
+            "node": "Enable Compat View (Feature Flag)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enable Compat View (Feature Flag)": {
+      "main": [
+        [
+          {
+            "node": "Apply v2 Schema & Replay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply v2 Schema & Replay": {
+      "main": [
+        [
+          {
+            "node": "Format Final Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": {},
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2025-01-27T00:00:00.000Z",
+  "versionId": "1"
+}
+
