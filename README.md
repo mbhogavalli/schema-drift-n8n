@@ -26,44 +26,68 @@ This workflow demonstrates a complete schema evolution pattern:
 2. Click **"Workflows"** → **"Import from File"**
 3. Select `n8n-schema-drift-demo.json`
 4. The workflow will be imported with all nodes configured
+5. **Activate the workflow** (toggle switch in top right)
 
-### 2. Run the Demo
+### 2. Get Webhook URL
 
-#### Option A: Chat Trigger (Recommended)
+1. Click on the **"Webhook: Ingest Flight Data"** node
+2. Copy the **Webhook URL** (e.g., `http://localhost:5678/webhook/schema-drift/ingest`)
+3. This URL accepts POST requests with flight data
 
-1. Click the **"Chat Trigger"** node
-2. Click **"Execute Node"** (or press `Ctrl/Cmd + Enter`)
-3. The workflow will run end-to-end automatically
+### 3. Send Test Data
 
-#### Option B: Step-by-Step Execution
+#### Option A: Using cURL
 
-You can also trigger individual steps by modifying the chat input:
+```bash
+curl -X POST http://localhost:5678/webhook/schema-drift/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "flight_id": "AA1234",
+    "origin": "JFK",
+    "destination": "SFO",
+    "depart_ts": "2025-06-01T16:00:00Z",
+    "cabin": "ECONOMY",
+    "fare_usd": 329.5,
+    "carrier_code": "AA",
+    "currency": "USD",
+    "taxes_usd": 54.2
+  }'
+```
 
-- `"run demo"` - Run full demo (default)
-- `"ingest batch A"` - Run only Batch A ingestion
-- `"ingest batch B"` - Run only Batch B ingestion
-- `"propose patch"` - Run agent analysis
-- `"enable compat"` - Enable compatibility view
-- `"apply v2"` - Apply v2 schema
+#### Option B: Using Test Script
 
-### 3. View Outputs
+```bash
+./test-webhook.sh http://localhost:5678
+```
 
-After each node execution, click on the node to see:
-- **Output data** with stage information
-- **Database state** (record counts)
-- **Validation results**
-- **Error details** (if any)
+#### Option C: Using Postman/Insomnia
+
+1. Create a POST request to the webhook URL
+2. Set Content-Type: `application/json`
+3. Send flight record(s) in the body
+
+### 4. View Outputs
+
+After sending data:
+1. Check the **webhook response** (JSON with validation results)
+2. Click on workflow nodes to see:
+   - **Validation results** (passed/quarantined)
+   - **Database state** (record counts)
+   - **Drift detection details**
+   - **Agent analysis** (if drift detected)
 
 ## 📊 Workflow Stages
 
-### Stage 0: Setup Schemas & v1 Contract
+### Stage 1: Webhook Trigger & Initialize
 
-**Node**: `Setup Schemas & v1 Contract`
+**Node**: `Webhook: Ingest Flight Data` → `Initialize & Parse Incoming Data`
 
-Creates three schemas:
-- `staging.flights_raw` - Raw payload storage
-- `gold.flights_pricing_v1` - Validated v1 data
-- `ops.quarantine` - Failed records with reasons
+- Receives POST requests with flight data
+- Accepts single record or array of records
+- Initializes database schemas on first run:
+  - `staging.flights_raw` - Raw payload storage
+  - `gold.flights_pricing_v1` - Validated v1 data
+  - `ops.quarantine` - Failed records with reasons
 
 **v1 Contract**:
 ```javascript
@@ -83,8 +107,9 @@ Creates three schemas:
 **Expected Output**:
 ```json
 {
-  "stage": "0. Setup Complete",
-  "schemas_created": ["staging.flights_raw", "gold.flights_pricing_v1", "ops.quarantine"],
+  "records": [...],
+  "record_count": 1,
+  "db_initialized": true,
   "db_state": {
     "staging_count": 0,
     "gold_v1_count": 0,
@@ -95,11 +120,18 @@ Creates three schemas:
 
 ---
 
-### Stage 1: Ingest Batch A (Good Data)
+### Stage 2: Validate & Detect Schema Drift
 
-**Node**: `Ingest Batch A (Good Data)`
+**Node**: `Validate & Detect Schema Drift`
 
-**Input Data**:
+**Process**:
+- Validates each record against v1 contract
+- Detects type errors (e.g., string instead of number)
+- Detects additive columns (fields not in v1 schema)
+- Inserts valid records into `gold.flights_pricing_v1`
+- Quarantines records with drift or validation errors
+
+**Example: Valid Record** (passes validation):
 ```json
 {
   "flight_id": "AA1234",
@@ -117,25 +149,21 @@ Creates three schemas:
 **Expected Output**:
 ```json
 {
-  "stage": "1. Batch A Ingested (✅ SUCCESS)",
-  "validation_result": "PASSED",
-  "action": "Inserted into gold.flights_pricing_v1",
-  "rows_inserted": 1,
-  "db_state": {
-    "staging_count": 1,
-    "gold_v1_count": 1,
-    "quarantine_count": 0
+  "stage": "Schema Validation & Drift Detection",
+  "records_processed": 1,
+  "results": [{
+    "validation_result": "PASSED",
+    "action": "Inserted into gold.flights_pricing_v1"
+  }],
+  "summary": {
+    "passed": 1,
+    "quarantined": 0,
+    "drift_detected": 0
   }
 }
 ```
 
----
-
-### Stage 2: Ingest Batch B (Drift Data)
-
-**Node**: `Ingest Batch B (Drift Data)`
-
-**Input Data** (with drift):
+**Example: Drift Record** (quarantined):
 ```json
 {
   "flight_id": "DL567",
@@ -143,29 +171,31 @@ Creates three schemas:
   "destination": "LAX",
   "depart_ts": "2025-06-02T09:30:00Z",
   "cabin": "ECONOMY",
-  "fare_usd": "three hundred",  // ❌ TYPE ERROR: string instead of number
+  "fare_usd": "three hundred",  // ❌ TYPE ERROR
   "carrier_code": "DL",
   "currency": "USD",
   "taxes_usd": 47.1,
-  "channel": "mobile"  // ❌ ADDITIVE COLUMN: not in v1 schema
+  "channel": "mobile"  // ❌ ADDITIVE COLUMN
 }
 ```
 
 **Expected Output**:
 ```json
 {
-  "stage": "2. Batch B Ingested (🛑 QUARANTINED - Schema Drift)",
-  "validation_result": "FAILED",
-  "drift_detected": true,
-  "drift_details": {
-    "type_error": "fare_usd is string \"three hundred\" instead of number",
-    "additive_column": "channel field not in v1 schema"
-  },
-  "action": "Quarantined for schema drift",
-  "db_state": {
-    "staging_count": 2,
-    "gold_v1_count": 1,
-    "quarantine_count": 1
+  "stage": "Schema Validation & Drift Detection",
+  "results": [{
+    "validation_result": "FAILED",
+    "drift_detected": true,
+    "drift_details": {
+      "typeErrors": ["fare_usd: expected number, got string"],
+      "additiveColumns": ["channel"]
+    },
+    "action": "Quarantined"
+  }],
+  "summary": {
+    "passed": 0,
+    "quarantined": 1,
+    "drift_detected": 1
   }
 }
 ```
@@ -174,7 +204,9 @@ Creates three schemas:
 
 ### Stage 3: Agent Analysis & Patch Proposal
 
-**Node**: `Agent: Propose Patch`
+**Node**: `Agent: Analyze Drift & Propose Patch`
+
+**Triggered**: Only when drift is detected
 
 Analyzes quarantined records and proposes a compatibility view.
 
@@ -215,62 +247,55 @@ FROM gold.flights_pricing_v1;
 
 ---
 
-### Stage 4: Enable Compat View (Feature Flag)
+### Stage 4: Webhook Response
 
-**Node**: `Enable Compat View (Feature Flag)`
+**Node**: `Respond to Webhook`
 
-Enables the compatibility view via feature flag, allowing readers to access the new schema without code changes.
+Returns JSON response with validation results and agent analysis.
 
-**Expected Output**:
+**Expected Response**:
 ```json
 {
-  "stage": "4. Feature Flag & Read Flights",
-  "feature_flag_enabled": true,
-  "view_used": "gold.flights_pricing_compat",
-  "flights": [
-    {
-      "flight_id": "AA1234",
-      "origin": "JFK",
-      "destination": "SFO",
-      "fare_usd": 329.5,
-      "channel": null  // ← Added via compat view
-    }
-  ],
-  "flight_count": 1
+  "success": true,
+  "timestamp": "2025-01-27T12:00:00.000Z",
+  "records_processed": 1,
+  "summary": {
+    "passed": 1,
+    "quarantined": 0,
+    "drift_detected": 0
+  },
+  "validation_results": [...],
+  "agent_analysis": false,
+  "db_state": {
+    "staging_count": 1,
+    "gold_v1_count": 1,
+    "quarantine_count": 0
+  },
+  "message": "All records processed successfully."
 }
 ```
 
----
-
-### Stage 5: Apply v2 Schema & Replay
-
-**Node**: `Apply v2 Schema & Replay`
-
-Creates v2 schema (extends v1 with nullable `channel`) and replays quarantined data.
-
-**v2 Schema Changes**:
-- Adds `channel` column (nullable VARCHAR)
-- Makes `fare_usd` tolerant (TRY_CAST with NULL on failure)
-
-**Expected Output**:
+**When Drift Detected**:
 ```json
 {
-  "stage": "5. v2 Schema Applied & Replay Successful",
-  "v2_schema_changes": {
-    "added_column": "channel (nullable VARCHAR)",
-    "fare_usd_tolerance": "TRY_CAST with NULL on failure"
+  "success": true,
+  "summary": {
+    "passed": 0,
+    "quarantined": 1,
+    "drift_detected": 1
   },
-  "replayed_record": {
-    "flight_id": "DL567",
-    "origin": "ATL",
-    "destination": "LAX",
-    "fare_usd": null,  // ← Converted from "three hundred"
-    "channel": "mobile",  // ← Now accepted
-    "schema_version": "v2"
-  },
-  "validation_result": "PASSED (v2)",
-  "action": "Inserted into gold.flights_pricing_v2",
-  "migration_note": "Downstreams can migrate to v2 when ready"
+  "agent_analysis": true,
+  "agent_suggestions": [
+    {
+      "issue": "fare_usd type mismatch",
+      "solution": "CAST with tolerance: TRY_CAST(fare_usd AS DOUBLE) AS fare_usd"
+    },
+    {
+      "issue": "Additive column: channel",
+      "solution": "Add nullable column: CAST(NULL AS VARCHAR) AS channel"
+    }
+  ],
+  "message": "Some records quarantined due to schema drift. Check agent_analysis for recommendations."
 }
 ```
 
@@ -279,50 +304,43 @@ Creates v2 schema (extends v1 with nullable `channel`) and replays quarantined d
 ## 🎨 Visual Flow
 
 ```
-┌─────────────────┐
-│  Chat Trigger   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────┐
-│  Parse Chat Command     │
-└────────┬────────────────┘
-         │
-         ▼
 ┌─────────────────────────────┐
-│  Setup Schemas & v1 Contract│
+│  Webhook: Ingest Flight Data│ ← POST /webhook/schema-drift/ingest
 └────────┬────────────────────┘
          │
          ▼
-┌──────────────────────────┐
-│  Ingest Batch A (Good)   │ ✅ → gold.flights_pricing_v1
-└────────┬─────────────────┘
+┌─────────────────────────────┐
+│ Initialize & Parse Incoming │ → Initialize DB schemas
+│          Data                │ → Parse flight record(s)
+└────────┬────────────────────┘
          │
          ▼
-┌──────────────────────────┐
-│  Ingest Batch B (Drift)  │ 🛑 → ops.quarantine
-└────────┬─────────────────┘
+┌─────────────────────────────┐
+│ Validate & Detect Schema     │ → Validate against v1 contract
+│          Drift               │ → Detect type errors & additive columns
+└────────┬────────────────────┘
+         │
+         ├─✅ Valid → gold.flights_pricing_v1
+         └─🛑 Drift → ops.quarantine
          │
          ▼
-┌──────────────────────────┐
-│  Agent: Propose Patch    │ 📝 → compat view SQL
-└────────┬─────────────────┘
+┌─────────────────────────────┐
+│ Agent: Analyze Drift &      │ → Analyze quarantine (if drift detected)
+│      Propose Patch           │ → Generate compat view SQL
+└────────┬────────────────────┘
          │
          ▼
-┌──────────────────────────┐
-│  Enable Compat (FF)      │ 🚩 → feature flag ON
-└────────┬─────────────────┘
-         │
-         ▼
-┌──────────────────────────┐
-│  Apply v2 Schema & Replay│ ✅ → gold.flights_pricing_v2
-└────────┬─────────────────┘
-         │
-         ▼
-┌──────────────────────────┐
-│  Format Final Output     │ 📊 → summary
-└──────────────────────────┘
+┌─────────────────────────────┐
+│   Respond to Webhook         │ → Return JSON response
+└─────────────────────────────┘
 ```
+
+**Streaming Data Flow**:
+- Each POST request processes one or more flight records
+- Records are validated in real-time
+- Drift is detected immediately
+- Agent analysis runs automatically when drift is detected
+- Response includes validation results and recommendations
 
 ## 🔍 Key Concepts Demonstrated
 
@@ -353,25 +371,103 @@ Creates v2 schema (extends v1 with nullable `channel`) and replays quarantined d
 - **Type Tolerance**: TRY_CAST handles type mismatches
 - **Replay Capability**: Re-process quarantined data after schema update
 
-## 🧪 Testing Individual Steps
+## 🧪 Testing Examples
 
-### Test Batch A Only
-1. Click "Chat Trigger"
-2. In the input, type: `"ingest batch A"`
-3. Execute the workflow
-4. Check output at "Ingest Batch A" node
+### Test Valid Record
 
-### Test Batch B Only
-1. Click "Chat Trigger"
-2. In the input, type: `"ingest batch B"`
-3. Execute the workflow
-4. Check output at "Ingest Batch B" node
+```bash
+curl -X POST http://localhost:5678/webhook/schema-drift/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "flight_id": "AA1234",
+    "origin": "JFK",
+    "destination": "SFO",
+    "depart_ts": "2025-06-01T16:00:00Z",
+    "cabin": "ECONOMY",
+    "fare_usd": 329.5,
+    "carrier_code": "AA",
+    "currency": "USD",
+    "taxes_usd": 54.2
+  }'
+```
 
-### Test Agent Analysis
-1. First run Batch B to create quarantine entry
-2. Click "Chat Trigger"
-3. Type: `"propose patch"`
-4. Execute and check "Agent: Propose Patch" output
+### Test Schema Drift (Type Error)
+
+```bash
+curl -X POST http://localhost:5678/webhook/schema-drift/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "flight_id": "DL567",
+    "origin": "ATL",
+    "destination": "LAX",
+    "depart_ts": "2025-06-02T09:30:00Z",
+    "cabin": "ECONOMY",
+    "fare_usd": "three hundred",
+    "carrier_code": "DL",
+    "currency": "USD",
+    "taxes_usd": 47.1
+  }'
+```
+
+### Test Schema Drift (Additive Column)
+
+```bash
+curl -X POST http://localhost:5678/webhook/schema-drift/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "flight_id": "UA789",
+    "origin": "ORD",
+    "destination": "DEN",
+    "depart_ts": "2025-06-03T14:00:00Z",
+    "cabin": "BUSINESS",
+    "fare_usd": 850.0,
+    "carrier_code": "UA",
+    "currency": "USD",
+    "taxes_usd": 120.5,
+    "channel": "mobile"
+  }'
+```
+
+### Test Batch Processing
+
+```bash
+curl -X POST http://localhost:5678/webhook/schema-drift/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "records": [
+      {
+        "flight_id": "BA456",
+        "origin": "LHR",
+        "destination": "JFK",
+        "depart_ts": "2025-06-04T10:00:00Z",
+        "cabin": "FIRST",
+        "fare_usd": 2500.0,
+        "carrier_code": "BA",
+        "currency": "GBP",
+        "taxes_usd": 300.0
+      },
+      {
+        "flight_id": "AF789",
+        "origin": "CDG",
+        "destination": "SFO",
+        "depart_ts": "2025-06-05T08:00:00Z",
+        "cabin": "PREMIUM",
+        "fare_usd": 1200.0,
+        "carrier_code": "AF",
+        "currency": "EUR",
+        "taxes_usd": 150.0
+      }
+    ]
+  }'
+```
+
+### Run All Tests
+
+Use the provided test script:
+
+```bash
+./test-webhook.sh http://localhost:5678
+```
 
 ## 📝 Notes
 
